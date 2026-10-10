@@ -113,34 +113,110 @@ let ncLast=null,ncOverlay=null,ncBusy=false;
 function ncSay(t){const e=document.getElementById('nowcast-status');if(e)e.textContent=t}
 function ncTile(lat,lon,z){const n=2**z,rad=lat*Math.PI/180;return{x:Math.floor((lon+180)/360*n),y:Math.floor((1-Math.asinh(Math.tan(rad))/Math.PI)/2*n)}}
 function ncBounds(x,y,z){const n=2**z;return [[Math.atan(Math.sinh(Math.PI*(1-2*(y+1)/n)))*180/Math.PI,x/n*360-180],[Math.atan(Math.sinh(Math.PI*(1-2*y/n)))*180/Math.PI,(x+1)/n*360-180]]}
-function ncPixels(url){return new Promise((resolve,reject)=>{const im=new Image();im.crossOrigin='anonymous';im.onload=()=>{try{const c=document.createElement('canvas');c.width=c.height=NC_SIZE;const ctx=c.getContext('2d',{willReadFrequently:true});ctx.drawImage(im,0,0,NC_SIZE,NC_SIZE);const a=ctx.getImageData(0,0,NC_SIZE,NC_SIZE).data,g=new Float32Array(NC_SIZE*NC_SIZE);for(let p=0,i=0;p<a.length;p+=4,i++)g[i]=(a[p+3]/255)*(0.2126*a[p]+0.7152*a[p+1]+0.0722*a[p+2]);resolve(g)}catch(e){reject(new Error('El proveedor bloqueó el análisis de píxeles desde el navegador (CORS).'))}};im.onerror=()=>reject(new Error('No se pudo cargar una tesela de radar.'));im.src=url})}
-function ncMatch(a,b){let best={dx:0,dy:0,score:Infinity},step=4,margin=32,max=20;for(let dy=-max;dy<=max;dy+=2)for(let dx=-max;dx<=max;dx+=2){let e=0,n=0;for(let y=margin;y<NC_SIZE-margin;y+=step)for(let x=margin;x<NC_SIZE-margin;x+=step){const av=a[y*NC_SIZE+x],bv=b[(y+dy)*NC_SIZE+x+dx];if(av<12&&bv<12)continue;e+=Math.abs(av-bv);n++}if(n>80&&e/n<best.score)best={dx,dy,score:e/n}}return best}
+function ncPixels(url){
+  return new Promise((resolve,reject)=>{
+    const im=new Image();
+    im.crossOrigin='anonymous';
+    im.onload=()=>{
+      try{
+        const c=document.createElement('canvas');c.width=c.height=NC_SIZE;
+        const ctx=c.getContext('2d',{willReadFrequently:true});
+        ctx.drawImage(im,0,0,NC_SIZE,NC_SIZE);
+        const a=ctx.getImageData(0,0,NC_SIZE,NC_SIZE).data;
+        const g=new Float32Array(NC_SIZE*NC_SIZE);
+        for(let p=0,i=0;p<a.length;p+=4,i++){
+          // Resalta ecos coloreados de precipitación y reduce el fondo transparente/oscuro.
+          const alpha=a[p+3]/255, max=Math.max(a[p],a[p+1],a[p+2]), min=Math.min(a[p],a[p+1],a[p+2]);
+          const saturation=max-min;
+          g[i]=alpha>0.15 && max>35 && saturation>18 ? alpha*(0.6*max+0.4*saturation) : 0;
+        }
+        resolve(g);
+      }catch(e){reject(new Error('El proveedor bloqueó el análisis de píxeles desde el navegador (CORS).'))}
+    };
+    im.onerror=()=>reject(new Error('No se pudo cargar una tesela de radar.'));
+    im.src=url;
+  });
+}
+function ncTileUrl(frame,x,y){
+  return `${NC_HOST}${frame.path}/256/${NC_Z}/${x}/${y}/2/1_1.png`;
+}
+async function ncMosaic(frame,center){
+  // Mosaico 3x3: mejora la posibilidad de encontrar precipitación cerca de la ubicación.
+  const tiles=[];
+  for(let oy=-1;oy<=1;oy++)for(let ox=-1;ox<=1;ox++){
+    tiles.push({x:center.x+ox,y:center.y+oy,ox,oy,url:ncTileUrl(frame,center.x+ox,center.y+oy)});
+  }
+  const loaded=await Promise.all(tiles.map(async t=>({...t,pixels:await ncPixels(t.url)})));
+  const size=NC_SIZE*3, data=new Float32Array(size*size);
+  for(const t of loaded){
+    for(let y=0;y<NC_SIZE;y++){
+      const src=y*NC_SIZE,dst=((t.oy+1)*NC_SIZE+y)*size+(t.ox+1)*NC_SIZE;
+      data.set(t.pixels.subarray(src,src+NC_SIZE),dst);
+    }
+  }
+  return {data,size,tiles:loaded};
+}
+function ncMatch(a,b,size){
+  let best={dx:0,dy:0,score:Infinity,signal:0};
+  const step=8,margin=NC_SIZE,max=36;
+  // Busca desplazamientos en el mosaico; omite píxeles donde ambas imágenes no tienen eco.
+  for(let dy=-max;dy<=max;dy+=2)for(let dx=-max;dx<=max;dx+=2){
+    let err=0,n=0,signal=0;
+    for(let y=margin;y<size-margin;y+=step)for(let x=margin;x<size-margin;x+=step){
+      const av=a[y*size+x],bv=b[(y+dy)*size+x+dx];
+      if(av<10&&bv<10)continue;
+      err+=Math.abs(av-bv);signal+=av+bv;n++;
+    }
+    if(n>35){
+      const score=err/n;
+      if(score<best.score)best={dx,dy,score,signal:n};
+    }
+  }
+  return best;
+}
 async function runNowcast(){
-  if(ncBusy)return;ncBusy=true;const run=document.getElementById('nowcast-run');run.disabled=true;
-  document.getElementById('nowcast-30').disabled=true;document.getElementById('nowcast-60').disabled=true;clearNowcast();
+  if(ncBusy)return;
+  ncBusy=true;
+  const run=document.getElementById('nowcast-run');
+  run.disabled=true;
+  document.getElementById('nowcast-30').disabled=true;
+  document.getElementById('nowcast-60').disabled=true;
+  clearNowcast();
   try{
     ncSay('Consultando imágenes históricas…');
-    const r=await nowcastFetchTimeout(NC_API,12000);if(!r.ok)throw Error('HTTP '+r.status);
-    const d=await r.json(),frames=(d.radar?.past||[]).filter(f=>f.path&&f.time).sort((a,b)=>a.time-b.time);
+    const r=await nowcastFetchTimeout(NC_API,12000);
+    if(!r.ok)throw Error('HTTP '+r.status);
+    const d=await r.json();
+    const frames=(d.radar?.past||[]).filter(f=>f.path&&f.time).sort((a,b)=>a.time-b.time);
     if(frames.length<2)throw Error('No hay dos imágenes históricas disponibles.');
-    const pair=frames.slice(-2),mins=(pair[1].time-pair[0].time)/60;if(mins<=0)throw Error('Marcas de tiempo no válidas.');
-    const t=ncTile(NC_LAT,NC_LON,NC_Z),url=f=>`${NC_HOST}${f.path}/256/${NC_Z}/${t.x}/${t.y}/2/1_1.png`;
-    ncSay('Comparando patrones visuales…');
-    const [a,b]=await Promise.all([ncPixels(url(pair[0])),ncPixels(url(pair[1]))]);
-    const m=ncMatch(a,b);if(!Number.isFinite(m.score)||m.score>70)throw Error('No se detectó un patrón consistente cerca de la ubicación.');
-    ncLast={mins,m,bounds:ncBounds(t.x,t.y,NC_Z),url:url(pair[1])};
-    document.getElementById('nowcast-30').disabled=false;document.getElementById('nowcast-60').disabled=false;
-    document.getElementById('nowcast-result').textContent=`Desplazamiento estimado: ${m.dx} px horizontal y ${m.dy} px vertical en ${Math.round(mins)} min. Error visual ${m.score.toFixed(1)}. Confianza baja; no estima probabilidad ni intensidad de lluvia.`;
-    ncSay('Análisis terminado; resultado experimental y de escala regional.');
-  }catch(e){ncSay('No se pudo calcular una proyección fiable: '+(e.message||'error'));document.getElementById('nowcast-result').textContent='Puede fallar por cobertura insuficiente, baja resolución o restricciones CORS. No se dibujó una proyección.'}
-  finally{ncBusy=false;run.disabled=false}
+    const pair=frames.slice(-2),mins=(pair[1].time-pair[0].time)/60;
+    if(mins<=0||mins>30)throw Error('El intervalo entre imágenes no es adecuado para una estimación.');
+    const center=ncTile(NC_LAT,NC_LON,NC_Z);
+    ncSay('Analizando un mosaico de 3 × 3 teselas…');
+    const [a,b]=await Promise.all([ncMosaic(pair[0],center),ncMosaic(pair[1],center)]);
+    const m=ncMatch(a.data,b.data,a.size);
+    if(!Number.isFinite(m.score)||m.score>65||m.signal<40)
+      throw Error('No hay suficiente señal de precipitación para estimar un desplazamiento fiable.');
+    // Limita el desplazamiento aceptado a una velocidad plausible en este intervalo.
+    if(Math.abs(m.dx)>30||Math.abs(m.dy)>30)
+      throw Error('El desplazamiento detectado es demasiado grande para confiar en él.');
+    ncLast={mins,m,bounds:ncBounds(center.x,center.y,NC_Z),url:ncTileUrl(pair[1],center.x,center.y)};
+    document.getElementById('nowcast-30').disabled=false;
+    document.getElementById('nowcast-60').disabled=false;
+    const confidence=m.score<25?'moderada':m.score<45?'baja':'muy baja';
+    document.getElementById('nowcast-result').textContent=`Intervalo observado: ${Math.round(mins)} min. Desplazamiento estimado en el mosaico: ${m.dx} px horizontal y ${m.dy} px vertical. Error visual ${m.score.toFixed(1)}; confianza ${confidence}. No estima probabilidad ni intensidad de lluvia.`;
+    ncSay('Análisis terminado; resultado experimental. Verifica visualmente antes de interpretarlo.');
+  }catch(e){
+    ncSay('No se pudo calcular una proyección fiable: '+(e.message||'error'));
+    document.getElementById('nowcast-result').textContent='Las proyecciones permanecen desactivadas para evitar mostrar un desplazamiento no sustentado.';
+  }finally{ncBusy=false;run.disabled=false}
 }
 function projectNowcast(mins){
   if(!ncLast)return;const map=window.GeoStationRadarMap;if(!map||!window.L){ncSay('El mapa Leaflet aún no está disponible.');return}
   clearNowcast();const m=ncLast.m,factor=mins/ncLast.mins,n=2**NC_Z,mid=(ncLast.bounds[0][0]+ncLast.bounds[1][0])/2,dx=m.dx*factor,dy=m.dy*factor,dLon=dx/NC_SIZE*360/n,dLat=-dy/NC_SIZE*(360/n)*Math.cos(mid*Math.PI/180),b=ncLast.bounds;
   const shifted=[[b[0][0]+dLat,b[0][1]+dLon],[b[1][0]+dLat,b[1][1]+dLon]];
   ncOverlay=window.L.imageOverlay(ncLast.url,shifted,{opacity:.38,interactive:false}).addTo(map);
-  ncSay(`Extrapolación visual de ${mins} min; resolución muy gruesa (zoom ${NC_Z}). No usar para decisiones de seguridad.`);
+  ncSay(`Extrapolación visual de ${mins} min sobre la tesela central; movimiento estimado con mosaico regional (zoom ${NC_Z}). No usar para decisiones de seguridad.`);
 }
 function clearNowcast(){const map=window.GeoStationRadarMap;if(ncOverlay&&map)try{map.removeLayer(ncOverlay)}catch(e){}ncOverlay=null}
 document.addEventListener('DOMContentLoaded',initNowcast);
